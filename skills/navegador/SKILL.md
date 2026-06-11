@@ -355,7 +355,7 @@ Se o player estiver em foco errado, primeiro `navegador click @ref-do-player` e 
 
 ## Idempotência e estado
 
-- O perfil é **único e compartilhado** entre todas as chamadas. Não crie outros perfis. Não passe `--profile` manualmente — o comando `navegador` já faz isso.
+- O perfil é **único e compartilhado** entre todas as chamadas. Não crie outros perfis. O comando `navegador` abre o Chrome com o perfil correto quando necessário e usa internamente a porta CDP detectada.
 - Não rode `agent-browser` direto: sempre `navegador`. Isso garante que o perfil correto seja usado.
 - Se algo parecer travado, `navegador close` e recomece do `open`. Como o perfil é persistente, logins continuam válidos.
 
@@ -370,7 +370,7 @@ Não abra a issue automaticamente. Apenas sugira, com o link, e siga em frente c
 ## O que NÃO fazer
 
 - Não use Playwright, Puppeteer, Selenium ou MCP de navegador. Use sempre `navegador`.
-- Não passe `--profile` ou `--headed` manualmente — já estão fixados pela função `navegador`.
+- Não passe `--profile`, `--headed` ou `--cdp` manualmente. Use sempre `navegador`, que abre o Chrome correto quando necessário e conecta pela porta CDP detectada.
 - Não feche o navegador no final, a menos que o usuário peça.
 - Não tente automatizar logins com senha. Peça ao humano para logar.
 - Não envie mensagens, faça compras, ou execute ações irreversíveis sem confirmação explícita do humano.

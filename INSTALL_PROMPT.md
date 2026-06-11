@@ -104,7 +104,7 @@ if ($policy -in @('Restricted', 'Undefined', 'AllSigned')) {
 
 O bloco usa os marcadores `# >>> navegador >>>` e `# <<< navegador <<<`. Se o bloco já existir, substitua. Se não existir, adicione ao final. Isso mantém a instalação idempotente e facilita rollback.
 
-Importante: a função `navegador` não pode abrir outro navegador ou outra janela alternativa quando `open`, `goto` ou `navigate` falharem ou demorarem demais. O comportamento correto é reutilizar a sessão existente; se o comando não responder em tempo razoável, interromper o processo e falhar explicitamente.
+Importante: a função `navegador` deve reutilizar o Chrome do Navegador quando ele já estiver aberto. Se estiver fechado, abra o Google Chrome real com `%USERPROFILE%\Navegador`, `--remote-debugging-port=0` e `--disable-blink-features=AutomationControlled`, detecte a porta CDP e chame o `agent-browser` com essa porta. Ela não deve abrir outro navegador ou outra janela alternativa quando `open`, `goto` ou `navigate` falharem ou demorarem demais; se o comando não responder em tempo razoável, interrompa o processo e falhe explicitamente.
 
 ```powershell
 $beginMarker = '# >>> navegador >>>'
@@ -128,7 +128,68 @@ function navegador {
         throw "Chrome not found. Install Google Chrome or check its installation path."
     }
 
-    agent-browser --profile "`$env:USERPROFILE\Navegador" --headed --executable-path `$chromeExe @Argumentos 2>`$null
+    `$agentBrowserExe = Join-Path "`$env:APPDATA" "npm\node_modules\agent-browser\bin\agent-browser-win32-x64.exe"
+    if (-not (Test-Path `$agentBrowserExe)) {
+        throw "agent-browser-win32-x64.exe not found. Reinstale o Navegador para restaurar a CLI."
+    }
+
+    if (`$Argumentos.Count -gt 0 -and `$Argumentos[0] -eq 'close') {
+        & `$agentBrowserExe @Argumentos
+        if (`$LASTEXITCODE -ne 0) {
+            throw ("agent-browser falhou com codigo {0}." -f `$LASTEXITCODE)
+        }
+        return
+    }
+
+    `$profilePath = Join-Path "`$env:USERPROFILE" "Navegador"
+    `$devToolsActivePortPath = Join-Path `$profilePath "DevToolsActivePort"
+    if (-not (Test-Path `$profilePath)) {
+        New-Item -ItemType Directory -Path `$profilePath -Force | Out-Null
+    }
+
+    `$chromeProcess = Get-CimInstance Win32_Process -Filter "name = 'chrome.exe'" | Where-Object {
+        `$_.CommandLine -and
+        `$_.CommandLine -notlike '*--type=*' -and
+        (`$_.CommandLine -like ('*user-data-dir=' + `$profilePath + '*') -or `$_.CommandLine -like ('*user-data-dir="' + `$profilePath + '"*'))
+    } | Select-Object -First 1
+
+    if (-not `$chromeProcess) {
+        Remove-Item -LiteralPath `$devToolsActivePortPath -Force -ErrorAction SilentlyContinue
+        Start-Process -FilePath `$chromeExe -ArgumentList @(
+            "--user-data-dir=`$profilePath",
+            "--remote-debugging-port=0",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-blink-features=AutomationControlled"
+        ) -WindowStyle Normal | Out-Null
+    }
+
+    `$deadline = (Get-Date).AddSeconds(15)
+    do {
+        `$cdpPort = if (Test-Path `$devToolsActivePortPath) {
+            Get-Content -LiteralPath `$devToolsActivePortPath -ErrorAction SilentlyContinue | Select-Object -First 1
+        }
+        `$cdpReady = `$false
+        if (-not [string]::IsNullOrWhiteSpace(`$cdpPort)) {
+            try {
+                `$null = Invoke-WebRequest -Uri "http://127.0.0.1:`$cdpPort/json/version" -UseBasicParsing -TimeoutSec 2
+                `$cdpReady = `$true
+            } catch {
+            }
+        }
+        if (-not `$cdpReady) {
+            Start-Sleep -Milliseconds 200
+        }
+    } until (`$cdpReady -or (Get-Date) -ge `$deadline)
+
+    if (-not `$cdpReady) {
+        throw "Chrome do Navegador abriu, mas a porta CDP nao ficou disponivel."
+    }
+
+    & `$agentBrowserExe --cdp `$cdpPort @Argumentos
+    if (`$LASTEXITCODE -ne 0) {
+        throw ("agent-browser falhou com codigo {0}." -f `$LASTEXITCODE)
+    }
 }
 $endMarker
 "@
@@ -148,11 +209,11 @@ if ($profileContent -match "(?ms)$([regex]::Escape($beginMarker)).*?$([regex]::E
 }
 ```
 
-Se existir uma instalação antiga que chame apenas `agent-browser --profile "$env:USERPROFILE\Navegador" --headed @Argumentos`, trate como desatualizada: substitua o bloco, feche o daemon e recarregue o `$PROFILE`.
+Se existir uma instalação antiga que chame `agent-browser --profile "$env:USERPROFILE\Navegador" --headed ...`, trate como desatualizada: substitua o bloco, feche o daemon e recarregue o `$PROFILE`.
 
 ### 3.3 Fechar o daemon e carregar a função
 
-O `agent-browser` usa daemon. Depois de iniciado, ele ignora novas flags como `--executable-path` e `--args` até ser fechado. Em upgrades, feche o daemon para reiniciar com as novas opções:
+O `agent-browser` usa daemon. Depois de iniciado, ele pode reutilizar a configuração da sessão anterior. Em upgrades, feche o daemon para reiniciar com as novas opções:
 
 ```powershell
 agent-browser close 2>$null
@@ -173,7 +234,7 @@ Para validar a versão carregada:
 (Get-Command navegador).Definition
 ```
 
-A definição deve conter `--executable-path` e `--disable-blink-features=AutomationControlled`.
+A definição deve conter `--cdp` e `--remote-debugging-port=0`.
 
 Depois disso, este comando:
 
@@ -184,7 +245,7 @@ navegador open myapp.com
 equivale a algo como:
 
 ```powershell
-agent-browser --profile "%USERPROFILE%\Navegador" --headed --executable-path "C:\Program Files\Google\Chrome\Application\chrome.exe" --args "--disable-blink-features=AutomationControlled" open myapp.com
+agent-browser --cdp <porta-detectada> open myapp.com
 ```
 
 A flag `--disable-blink-features=AutomationControlled` oculta o marcador `navigator.webdriver`, usado por alguns sites para detectar automação.
@@ -307,7 +368,7 @@ Se o computador tiver WSL2 com pelo menos uma distro Ubuntu 24+, a mesma instala
 
 - instalar um executavel `navegador` em `~/.local/bin` de cada distro suportada;
 - registrar `SKILL.md` em `~/.codex/skills/navegador` e `~/.claude/skills/navegador` quando esses diretorios existirem;
-- chamar diretamente o executavel Windows do `agent-browser` com o mesmo perfil e as mesmas flags definidas para o PowerShell.
+- abrir o Google Chrome real com o perfil `%USERPROFILE%\Navegador`, quando ele ainda não estiver aberto, detectar a porta CDP e então chamar diretamente o executavel Windows do `agent-browser` com `--cdp`.
 
 Se não houver WSL2, ou se nenhuma distro for Ubuntu 24+, ignore este passo e registre o motivo no relatório final. Nunca interrompa a instalação por causa do WSL2.
 
@@ -315,7 +376,7 @@ Notas importantes:
 
 - O nome de usuário do WSL costuma ser diferente do nome do Windows. Isso não impede a instalação, porque o wrapper é gravado no `$HOME` da própria distro.
 - Evite chamar `powershell.exe` para executar `navegador` dentro do WSL. Na prática isso pode concluir a automação e ainda deixar o processo Unix pendurado.
-- O wrapper do WSL deve chamar diretamente `agent-browser-win32-x64.exe`, fixando `--profile`, `--headed`, `--args "--disable-blink-features=AutomationControlled"` e, quando existir, `--executable-path` para o Chrome real do Windows.
+- O wrapper do WSL deve chamar diretamente `agent-browser-win32-x64.exe --cdp <porta-detectada>`. Quando o Chrome do Navegador estiver fechado, o wrapper deve abrir antes o Google Chrome real do Windows com `%USERPROFILE%\Navegador`, `--remote-debugging-port=0` e `--disable-blink-features=AutomationControlled`.
 - Prefira um executável em `~/.local/bin` em vez de uma função no `.bashrc`. Assim o comando funciona em shells não interativos e evita a necessidade de `bash -ic`, que pode deixar processos pendurados em agentes que rodam sem TTY.
 - Se o PowerShell estiver rodando a partir de `\\wsl.localhost\...`, mude antes para um diretório do Windows com `Push-Location $env:USERPROFILE`. Sem isso, o `wsl.exe` pode falhar ao tentar traduzir o diretório atual.
 - Quoting entre PowerShell e bash é frágil para here-docs, regex e caminhos Windows. Por isso este passo grava arquivos temporários em `$env:TEMP`, converte o caminho para `/mnt/c/...` e chama `wsl`.
@@ -407,11 +468,26 @@ AGENT_BROWSER_EXE='__AGENT_BROWSER_EXE__'
 PROFILE_WIN='__PROFILE_WIN__'
 CHROME_WIN='__CHROME_WIN__'
 
-if [ -n "$CHROME_WIN" ]; then
-    "$AGENT_BROWSER_EXE" --profile "$PROFILE_WIN" --headed --executable-path "$CHROME_WIN" --args "--disable-blink-features=AutomationControlled" "$@"
-else
-    "$AGENT_BROWSER_EXE" --profile "$PROFILE_WIN" --headed --args "--disable-blink-features=AutomationControlled" "$@"
+if [ "${1:-}" = "close" ]; then
+    "$AGENT_BROWSER_EXE" "$@"
+    exit $?
 fi
+
+has_navegador_chrome() {
+    powershell.exe -NoProfile -Command "\$profilePath = '$PROFILE_WIN'; [bool](Get-CimInstance Win32_Process -Filter \"name = 'chrome.exe'\" | Where-Object { \$_.CommandLine -and \$_.CommandLine -notlike '*--type=*' -and (\$_.CommandLine -like \"*user-data-dir=\$profilePath*\" -or \$_.CommandLine -like \"*user-data-dir=\`\"\$profilePath\`\"*\") } | Select-Object -First 1)" | tr -d '\r' | grep -qi '^true$'
+}
+
+if ! has_navegador_chrome; then
+    if [ -n "$CHROME_WIN" ]; then
+        powershell.exe -NoProfile -Command "Start-Process -FilePath '$CHROME_WIN' -ArgumentList @('--user-data-dir=$PROFILE_WIN','--remote-debugging-port=0','--no-first-run','--no-default-browser-check','--disable-blink-features=AutomationControlled') -WindowStyle Normal" >/dev/null
+    else
+        echo "Chrome real nao configurado para o Navegador." >&2
+        exit 1
+    fi
+fi
+
+CDP_PORT="$(powershell.exe -NoProfile -Command "\$deadline = (Get-Date).AddSeconds(15); \$path = Join-Path '$PROFILE_WIN' 'DevToolsActivePort'; do { if (Test-Path \$path) { \$port = Get-Content -LiteralPath \$path -ErrorAction SilentlyContinue | Select-Object -First 1; if (\$port) { try { Invoke-WebRequest -Uri \"http://127.0.0.1:\$port/json/version\" -UseBasicParsing -TimeoutSec 2 | Out-Null; Write-Output \$port; exit 0 } catch {} } }; Start-Sleep -Milliseconds 200 } until ((Get-Date) -ge \$deadline); exit 1" | tr -d '\r')"
+"$AGENT_BROWSER_EXE" --cdp "$CDP_PORT" "$@"
 '@
     $wrapperWsl = $wrapperWsl.Replace('__AGENT_BROWSER_EXE__', $agentBrowserExeLinux)
     $wrapperWsl = $wrapperWsl.Replace('__PROFILE_WIN__', $profileWin)
