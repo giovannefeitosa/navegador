@@ -263,22 +263,12 @@ function Get-NavegadorShortcutArguments {
 
     $profilePath = Join-Path $env:USERPROFILE "Navegador"
     $arguments = @(
-        '--profile'
+        '--user-data-dir'
         ('"{0}"' -f $profilePath)
-        '--headed'
-    )
-
-    if ($ChromePath) {
-        $arguments += @(
-            '--executable-path'
-            ('"{0}"' -f $ChromePath)
-        )
-    }
-
-    $arguments += @(
-        '--args'
-        '"--disable-blink-features=AutomationControlled"'
-        'open'
+        '--remote-debugging-port=0'
+        '--no-first-run'
+        '--no-default-browser-check'
+        '--disable-blink-features=AutomationControlled'
         'about:blank'
     )
 
@@ -303,7 +293,7 @@ function Install-NavegadorShortcuts {
 
     Set-Shortcut `
         -ShortcutPath $desktopShortcut `
-        -TargetPath $AgentBrowserExe `
+        -TargetPath $ChromePath `
         -Arguments $arguments `
         -WorkingDirectory $env:USERPROFILE `
         -IconLocation $iconLocation `
@@ -453,58 +443,121 @@ function navegador {
         throw "agent-browser-win32-x64.exe not found. Reinstale o Navegador para restaurar a CLI."
     }
 
-    `$stdoutPath = Join-Path "`$env:TEMP" ("agent-browser-" + [guid]::NewGuid().ToString() + ".out")
-    `$stderrPath = Join-Path "`$env:TEMP" ("agent-browser-" + [guid]::NewGuid().ToString() + ".err")
+    if (`$Argumentos.Count -gt 0 -and `$Argumentos[0] -eq 'close') {
+        & `$agentBrowserExe @Argumentos
+        if (`$LASTEXITCODE -ne 0) {
+            throw ("agent-browser falhou com codigo {0}." -f `$LASTEXITCODE)
+        }
+        return
+    }
 
-    try {
-        `$agentBrowserArgs = @(
-            '--profile'
-            "`$env:USERPROFILE\Navegador"
-            '--headed'
-            '--executable-path'
-            `$chromeExe
-            '--args'
-            '--disable-blink-features=AutomationControlled'
-        ) + `$Argumentos
+    `$profilePath = Join-Path "`$env:USERPROFILE" "Navegador"
+    `$devToolsActivePortPath = Join-Path `$profilePath "DevToolsActivePort"
 
-        `$agentBrowserArgumentLine = ((`$agentBrowserArgs | ForEach-Object { ConvertTo-NavegadorCliArgument -Value `$_ }) -join ' ')
-        `$process = Start-Process -FilePath `$agentBrowserExe -ArgumentList `$agentBrowserArgumentLine -RedirectStandardOutput `$stdoutPath -RedirectStandardError `$stderrPath -PassThru -WindowStyle Hidden
+    if (-not (Test-Path `$profilePath)) {
+        New-Item -ItemType Directory -Path `$profilePath -Force | Out-Null
+    }
 
-        `$timeoutSeconds = 30
-        if (-not `$process.WaitForExit(`$timeoutSeconds * 1000)) {
+    function Test-NavegadorCdpPort {
+        param(
+            [string]`$Port
+        )
+
+        if ([string]::IsNullOrWhiteSpace(`$Port)) {
+            return `$false
+        }
+
+        try {
+            `$null = Invoke-WebRequest -Uri "http://127.0.0.1:`$Port/json/version" -UseBasicParsing -TimeoutSec 2
+            return `$true
+        } catch {
+            return `$false
+        }
+    }
+
+    function Get-NavegadorChromeProcess {
+        Get-CimInstance Win32_Process -Filter "name = 'chrome.exe'" | Where-Object {
+            `$_.CommandLine -and
+            `$_.CommandLine -notlike '*--type=*' -and
+            (
+                `$_.CommandLine -like ('*user-data-dir=' + `$profilePath + '*') -or
+                `$_.CommandLine -like ('*user-data-dir="' + `$profilePath + '"*')
+            )
+        } | Select-Object -First 1
+    }
+
+    function Start-NavegadorChrome {
+        Remove-Item -LiteralPath `$devToolsActivePortPath -Force -ErrorAction SilentlyContinue
+
+        `$chromeArgs = @(
+            "--user-data-dir=`$profilePath",
+            "--remote-debugging-port=0",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-blink-features=AutomationControlled"
+        )
+
+        Start-Process -FilePath `$chromeExe -ArgumentList `$chromeArgs -WindowStyle Normal | Out-Null
+    }
+
+    `$chromeProcess = Get-NavegadorChromeProcess
+    if (-not `$chromeProcess) {
+        Start-NavegadorChrome
+    }
+
+    `$cdpPort = `$null
+    `$deadline = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt `$deadline) {
+        if (Test-Path `$devToolsActivePortPath) {
+            `$cdpPort = (Get-Content -LiteralPath `$devToolsActivePortPath -ErrorAction SilentlyContinue | Select-Object -First 1)
+            if (Test-NavegadorCdpPort -Port `$cdpPort) {
+                break
+            }
+        }
+
+        if (-not (Get-NavegadorChromeProcess)) {
+            Start-NavegadorChrome
+        }
+
+        Start-Sleep -Milliseconds 200
+    }
+
+    if (-not (Test-NavegadorCdpPort -Port `$cdpPort)) {
+        throw "Chrome do Navegador abriu, mas a porta CDP nao ficou disponivel."
+    }
+
+    if (`$Argumentos.Count -gt 0 -and `$Argumentos[0] -in @('open', 'goto', 'navigate')) {
+        if (`$Argumentos.Count -gt 1) {
+            Start-Process -FilePath `$chromeExe -ArgumentList @("--user-data-dir=`$profilePath", `$Argumentos[1]) -WindowStyle Normal | Out-Null
+        }
+
+        `$deadline = (Get-Date).AddSeconds(10)
+        do {
             try {
-                Stop-Process -Id `$process.Id -Force -ErrorAction SilentlyContinue
+                `$tabsResponse = Invoke-WebRequest -Uri "http://127.0.0.1:`$cdpPort/json/list" -UseBasicParsing -TimeoutSec 2
+                `$tabs = `$tabsResponse.Content | ConvertFrom-Json
+                `$currentUrl = `$tabs | Where-Object { `$_.type -eq 'page' -and `$_.url -and `$_.url -notlike 'chrome://*' } | Select-Object -First 1 -ExpandProperty url
+                if (-not [string]::IsNullOrWhiteSpace(`$currentUrl)) {
+                    [Console]::Out.Write((`$currentUrl | Out-String))
+                    return
+                }
             } catch {
             }
-            throw ("agent-browser nao respondeu em {0} segundos. O comando foi interrompido sem abrir navegador alternativo." -f `$timeoutSeconds)
-        }
 
-        `$stdout = if (Test-Path `$stdoutPath) { Get-Content -Path `$stdoutPath -Raw } else { "" }
-        `$stderr = if (Test-Path `$stderrPath) { Get-Content -Path `$stderrPath -Raw } else { "" }
-        `$filteredStderr = ((`$stderr -split "`r?`n") | Where-Object {
-            `$_ -and `$_ -notmatch 'ignored: daemon already running'
-        }) -join [Environment]::NewLine
+            Start-Sleep -Milliseconds 200
+        } until ((Get-Date) -ge `$deadline)
 
-        if (-not [string]::IsNullOrWhiteSpace(`$stdout)) {
-            [Console]::Out.Write(`$stdout)
-        }
+        return
+    }
 
-        if (-not [string]::IsNullOrWhiteSpace(`$filteredStderr)) {
-            [Console]::Error.WriteLine(`$filteredStderr)
-        }
+    `$agentBrowserArgs = @(
+        '--cdp'
+        `$cdpPort
+    ) + `$Argumentos
 
-        `$exitCode = $null
-        try {
-            `$process.Refresh()
-            `$exitCode = `$process.ExitCode
-        } catch {
-        }
-
-        if (`$null -ne `$exitCode -and `$exitCode -ne 0) {
-            throw ("agent-browser falhou com codigo {0}." -f `$exitCode)
-        }
-    } finally {
-        Remove-Item -LiteralPath `$stdoutPath, `$stderrPath -Force -ErrorAction SilentlyContinue
+    & `$agentBrowserExe @agentBrowserArgs
+    if (`$LASTEXITCODE -ne 0) {
+        throw ("agent-browser falhou com codigo {0}." -f `$LASTEXITCODE)
     }
 }
 $endMarker
@@ -530,7 +583,7 @@ $navegadorCommand = Get-Command navegador -ErrorAction SilentlyContinue
 if (-not $navegadorCommand) {
     throw "A funcao navegador nao ficou disponivel apos carregar o `$PROFILE."
 }
-if ($navegadorCommand.Definition -notmatch "--executable-path" -or $navegadorCommand.Definition -notmatch "--disable-blink-features=AutomationControlled") {
+if ($navegadorCommand.Definition -notmatch "--cdp" -or $navegadorCommand.Definition -notmatch "--remote-debugging-port=0") {
     throw "A definicao da funcao navegador nao contem as flags esperadas."
 }
 
@@ -610,11 +663,34 @@ AGENT_BROWSER_EXE='__AGENT_BROWSER_EXE__'
 PROFILE_WIN='__PROFILE_WIN__'
 CHROME_WIN='__CHROME_WIN__'
 
-if [ -n "$CHROME_WIN" ]; then
-    "$AGENT_BROWSER_EXE" --profile "$PROFILE_WIN" --headed --executable-path "$CHROME_WIN" --args "--disable-blink-features=AutomationControlled" "$@"
-else
-    "$AGENT_BROWSER_EXE" --profile "$PROFILE_WIN" --headed --args "--disable-blink-features=AutomationControlled" "$@"
+if [ "${1:-}" = "close" ]; then
+    "$AGENT_BROWSER_EXE" "$@"
+    exit $?
 fi
+
+has_navegador_chrome() {
+    powershell.exe -NoProfile -Command "\$profilePath = '$PROFILE_WIN'; [bool](Get-CimInstance Win32_Process -Filter \"name = 'chrome.exe'\" | Where-Object { \$_.CommandLine -and \$_.CommandLine -notlike '*--type=*' -and (\$_.CommandLine -like \"*user-data-dir=\$profilePath*\" -or \$_.CommandLine -like \"*user-data-dir=\`\"\$profilePath\`\"*\") } | Select-Object -First 1)" | tr -d '\r' | grep -qi '^true$'
+}
+
+if ! has_navegador_chrome; then
+    if [ -n "$CHROME_WIN" ]; then
+        powershell.exe -NoProfile -Command "Start-Process -FilePath '$CHROME_WIN' -ArgumentList @('--user-data-dir=$PROFILE_WIN','--remote-debugging-port=0','--no-first-run','--no-default-browser-check','--disable-blink-features=AutomationControlled') -WindowStyle Normal" >/dev/null
+    else
+        echo "Chrome real nao configurado para o Navegador." >&2
+        exit 1
+    fi
+fi
+
+CDP_PORT="$(powershell.exe -NoProfile -Command "\$deadline = (Get-Date).AddSeconds(15); \$path = Join-Path '$PROFILE_WIN' 'DevToolsActivePort'; do { if (Test-Path \$path) { \$port = Get-Content -LiteralPath \$path -ErrorAction SilentlyContinue | Select-Object -First 1; if (\$port) { try { Invoke-WebRequest -Uri \"http://127.0.0.1:\$port/json/version\" -UseBasicParsing -TimeoutSec 2 | Out-Null; Write-Output \$port; exit 0 } catch {} } }; Start-Sleep -Milliseconds 200 } until ((Get-Date) -ge \$deadline); exit 1" | tr -d '\r')"
+if [ "${1:-}" = "open" ] || [ "${1:-}" = "goto" ] || [ "${1:-}" = "navigate" ]; then
+    if [ -n "${2:-}" ]; then
+        powershell.exe -NoProfile -Command "Start-Process -FilePath '$CHROME_WIN' -ArgumentList @('--user-data-dir=$PROFILE_WIN','$2') -WindowStyle Normal" >/dev/null
+    fi
+    powershell.exe -NoProfile -Command "\$port = '$CDP_PORT'; \$tabs = (Invoke-WebRequest -Uri \"http://127.0.0.1:\$port/json/list\" -UseBasicParsing).Content | ConvertFrom-Json; \$tabs | Where-Object { \$_.type -eq 'page' -and \$_.url -and \$_.url -notlike 'chrome://*' } | Select-Object -First 1 -ExpandProperty url" | tr -d '\r'
+    exit 0
+fi
+
+"$AGENT_BROWSER_EXE" --cdp "$CDP_PORT" "$@"
 '@
         $wslWrapper = $wslWrapper.Replace("__AGENT_BROWSER_EXE__", $agentBrowserExeLinux)
         $wslWrapper = $wslWrapper.Replace("__PROFILE_WIN__", $profileWin)

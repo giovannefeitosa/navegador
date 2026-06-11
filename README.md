@@ -10,6 +10,7 @@ A instalação cria um perfil persistente em `%USERPROFILE%\Navegador`. Logins, 
 - O Chrome e os dados do usuário ficam no Windows, não no WSL2.
 - Todas as automações usam o mesmo Google Chrome e o mesmo perfil: `%USERPROFILE%\Navegador`.
 - O instalador cria a função `navegador` no `$PROFILE` do PowerShell.
+- A função `navegador` reutiliza o Chrome do Navegador quando ele já está aberto; se estiver fechado, abre o Chrome real com o perfil persistente e então conecta pela porta CDP detectada.
 - A função `navegador` não deve fechar nem recriar a sessão aberta só porque um comando `open`, `goto` ou `navigate` demorou para responder.
 - O projeto não usa navegador alternativo: se o Google Chrome real não estiver disponível ou um comando não responder, deve falhar explicitamente.
 - O instalador cria apenas um atalho `Navegador` na área de trabalho do Windows.
@@ -71,6 +72,6 @@ Para testar login no Google, rode `navegador open https://accounts.google.com`. 
 
 Se o login no Google ou em outros sites continuar bloqueado após atualizar o repositório, a máquina provavelmente ainda está usando uma função `navegador` antiga no `$PROFILE` do PowerShell.
 
-Após atualizar, confirme que `(Get-Command navegador).Definition` contém `--executable-path` e `--disable-blink-features=AutomationControlled`. Depois rode `agent-browser close`, recarregue o `$PROFILE` com `. $PROFILE` e teste de novo.
+Após atualizar, confirme que `(Get-Command navegador).Definition` contém `--cdp` e `--remote-debugging-port=0`. Depois rode `agent-browser close`, recarregue o `$PROFILE` com `. $PROFILE` e teste de novo.
 
 O daemon reutiliza a configuração antiga enquanto continuar rodando.
