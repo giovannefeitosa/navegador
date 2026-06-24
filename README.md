@@ -21,6 +21,8 @@ A instalação cria um perfil persistente em `%USERPROFILE%\Navegador`. Logins, 
 - WSL2 é opcional. Se existir uma ou mais distros Ubuntu 24+, o mesmo instalador PowerShell cria um executável `navegador` em `~/.local/bin` de cada uma, remove wrappers antigos do `.bashrc` e registra a skill nos diretórios Linux do Codex/Claude quando eles existirem. Outras distros são ignoradas.
 - Se Codex e Claude Code estiverem instalados, a skill é registrada nos dois.
 - A skill é instalada com escopo global e pode ser usada em qualquer projeto.
+- O `agent-browser` **não lança** o Chrome: ele apenas **conecta** via CDP (`--cdp`). Quem abre o Chrome real é a própria função `navegador` (e o atalho da área de trabalho), de forma **normal**, com `--remote-debugging-port=9333`. Isso é necessário para serviços com DRM (Netflix, etc.): quando o `agent-browser` lança o Chrome, ele injeta `--disable-component-update`, e essa flag impede o registro do componente Widevine — então o EME falha mesmo com `chrome://settings/content/protectedContent` ativado. Copiar arquivos do Widevine para o perfil **não resolve**, porque sem o component updater o Chrome nem registra um CDM já presente. Lançar o Chrome normalmente registra o Widevine bundled e o DRM funciona.
+- `navegador close` encerra o Chrome do perfil `%USERPROFILE%\Navegador` (com `--cdp`, o `agent-browser` só desconecta, por isso a função mata o processo do Chrome).
 
 ## Requisitos
 
@@ -71,6 +73,6 @@ Para testar login no Google, rode `navegador open https://accounts.google.com`. 
 
 Se o login no Google ou em outros sites continuar bloqueado após atualizar o repositório, a máquina provavelmente ainda está usando uma função `navegador` antiga no `$PROFILE` do PowerShell.
 
-Após atualizar, confirme que `(Get-Command navegador).Definition` contém `--executable-path` e `--disable-blink-features=AutomationControlled`. Depois rode `agent-browser close`, recarregue o `$PROFILE` com `. $PROFILE` e teste de novo.
+Após atualizar, confirme que `(Get-Command navegador).Definition` contém `--cdp` e `--remote-debugging-port` (a função nova conecta o `agent-browser` ao Chrome em vez de deixá-lo lançar o Chrome). Depois rode `navegador close`, recarregue o `$PROFILE` com `. $PROFILE` e teste de novo.
 
 O daemon reutiliza a configuração antiga enquanto continuar rodando.

@@ -257,28 +257,17 @@ function Set-Shortcut {
 }
 
 function Get-NavegadorShortcutArguments {
-    param(
-        [string]$ChromePath
-    )
-
+    # O atalho abre o Chrome real NORMALMENTE (sem --disable-component-update) no
+    # perfil Navegador, com a mesma porta de depuracao que a funcao navegador usa
+    # para conectar via --cdp. Lancar normalmente registra o Widevine (DRM/Netflix).
     $profilePath = Join-Path $env:USERPROFILE "Navegador"
+    $debugPort = 9333
     $arguments = @(
-        '--profile'
-        ('"{0}"' -f $profilePath)
-        '--headed'
-    )
-
-    if ($ChromePath) {
-        $arguments += @(
-            '--executable-path'
-            ('"{0}"' -f $ChromePath)
-        )
-    }
-
-    $arguments += @(
-        '--args'
-        '"--disable-blink-features=AutomationControlled"'
-        'open'
+        ('--user-data-dir="{0}"' -f $profilePath)
+        '--no-first-run'
+        '--no-default-browser-check'
+        ("--remote-debugging-port={0}" -f $debugPort)
+        '--disable-blink-features=AutomationControlled'
         'about:blank'
     )
 
@@ -296,14 +285,14 @@ function Install-NavegadorShortcuts {
 
     $shortcutName = "Navegador.lnk"
     $desktopShortcut = Join-Path ([Environment]::GetFolderPath("Desktop")) $shortcutName
-    $arguments = Get-NavegadorShortcutArguments -ChromePath $ChromePath
+    $arguments = Get-NavegadorShortcutArguments
     $iconPath = Join-Path (Join-Path $env:USERPROFILE "Navegador") "navegador.ico"
     $iconLocation = Install-IconFile -RequestedPath $IconSourcePath -RequestedUrl $IconUrl -DestinationPath $iconPath
     $description = "Abre o Navegador com o perfil persistente do Windows."
 
     Set-Shortcut `
         -ShortcutPath $desktopShortcut `
-        -TargetPath $AgentBrowserExe `
+        -TargetPath $ChromePath `
         -Arguments $arguments `
         -WorkingDirectory $env:USERPROFILE `
         -IconLocation $iconLocation `
@@ -422,19 +411,21 @@ function navegador {
     )
 
     function ConvertTo-NavegadorCliArgument {
-        param(
-            [string]`$Value
-        )
-
-        if (`$null -eq `$Value) {
-            return '""'
-        }
-
-        if (`$Value -match '[\s"]') {
-            return '"' + (`$Value -replace '"', '\"') + '"'
-        }
-
+        param([string]`$Value)
+        if (`$null -eq `$Value) { return '""' }
+        if (`$Value -match '[\s"]') { return '"' + (`$Value -replace '"', '\"') + '"' }
         return `$Value
+    }
+
+    function Test-NavegadorPort {
+        param([int]`$Port)
+        return [bool](Get-NetTCPConnection -LocalPort `$Port -State Listen -ErrorAction SilentlyContinue)
+    }
+
+    function Get-NavegadorChromeProcs {
+        param([string]`$ProfileDir)
+        return @(Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { `$_.CommandLine -and `$_.CommandLine -match [regex]::Escape(`$ProfileDir) })
     }
 
     `$chromePaths = @(
@@ -443,7 +434,6 @@ function navegador {
         "`$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
     )
     `$chromeExe = `$chromePaths | Where-Object { Test-Path `$_ } | Select-Object -First 1
-
     if (-not `$chromeExe) {
         throw "Chrome not found. Install Google Chrome or check its installation path."
     }
@@ -453,53 +443,64 @@ function navegador {
         throw "agent-browser-win32-x64.exe not found. Reinstale o Navegador para restaurar a CLI."
     }
 
+    `$profileDir = "`$env:USERPROFILE\Navegador"
+    `$debugPort = 9333
+
+    # 'close' encerra o Chrome do perfil Navegador. Com --cdp o agent-browser
+    # apenas desconecta, entao encerramos o processo do Chrome explicitamente.
+    if (`$Argumentos.Count -ge 1 -and `$Argumentos[0] -eq 'close') {
+        try { & `$agentBrowserExe --cdp `$debugPort close 2>`$null | Out-Null } catch { }
+        foreach (`$proc in (Get-NavegadorChromeProcs -ProfileDir `$profileDir)) {
+            Stop-Process -Id `$proc.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        return
+    }
+
+    # Garante o Chrome real aberto no perfil, lancado NORMALMENTE (sem
+    # --disable-component-update). Isso registra o componente Widevine e permite
+    # DRM/Netflix. O agent-browser apenas CONECTA via --cdp; ele nunca lanca o
+    # Chrome aqui, senao injetaria --disable-component-update e o Widevine nao
+    # seria registrado.
+    if (-not (Test-NavegadorPort -Port `$debugPort)) {
+        foreach (`$proc in (Get-NavegadorChromeProcs -ProfileDir `$profileDir)) {
+            Stop-Process -Id `$proc.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 400
+        `$chromeArgumentLine = '--user-data-dir="' + `$profileDir + '" --no-first-run --no-default-browser-check --remote-debugging-port=' + `$debugPort + ' --disable-blink-features=AutomationControlled about:blank'
+        Start-Process -FilePath `$chromeExe -ArgumentList `$chromeArgumentLine | Out-Null
+        `$deadline = (Get-Date).AddSeconds(20)
+        while (-not (Test-NavegadorPort -Port `$debugPort) -and (Get-Date) -lt `$deadline) {
+            Start-Sleep -Milliseconds 300
+        }
+        if (-not (Test-NavegadorPort -Port `$debugPort)) {
+            throw "Chrome nao abriu a porta de depuracao `$debugPort. Nenhum navegador alternativo foi aberto."
+        }
+    }
+
     `$stdoutPath = Join-Path "`$env:TEMP" ("agent-browser-" + [guid]::NewGuid().ToString() + ".out")
     `$stderrPath = Join-Path "`$env:TEMP" ("agent-browser-" + [guid]::NewGuid().ToString() + ".err")
-
     try {
-        `$agentBrowserArgs = @(
-            '--profile'
-            "`$env:USERPROFILE\Navegador"
-            '--headed'
-            '--executable-path'
-            `$chromeExe
-            '--args'
-            '--disable-blink-features=AutomationControlled'
-        ) + `$Argumentos
-
+        `$agentBrowserArgs = @('--cdp', "`$debugPort") + `$Argumentos
         `$agentBrowserArgumentLine = ((`$agentBrowserArgs | ForEach-Object { ConvertTo-NavegadorCliArgument -Value `$_ }) -join ' ')
         `$process = Start-Process -FilePath `$agentBrowserExe -ArgumentList `$agentBrowserArgumentLine -RedirectStandardOutput `$stdoutPath -RedirectStandardError `$stderrPath -PassThru -WindowStyle Hidden
 
         `$timeoutSeconds = 30
         if (-not `$process.WaitForExit(`$timeoutSeconds * 1000)) {
-            try {
-                Stop-Process -Id `$process.Id -Force -ErrorAction SilentlyContinue
-            } catch {
-            }
+            try { Stop-Process -Id `$process.Id -Force -ErrorAction SilentlyContinue } catch { }
             throw ("agent-browser nao respondeu em {0} segundos. O comando foi interrompido sem abrir navegador alternativo." -f `$timeoutSeconds)
         }
 
         `$stdout = if (Test-Path `$stdoutPath) { Get-Content -Path `$stdoutPath -Raw } else { "" }
         `$stderr = if (Test-Path `$stderrPath) { Get-Content -Path `$stderrPath -Raw } else { "" }
-        `$filteredStderr = ((`$stderr -split "`r?`n") | Where-Object {
+        `$filteredStderr = ((`$stderr -split "\r?\n") | Where-Object {
             `$_ -and `$_ -notmatch 'ignored: daemon already running'
         }) -join [Environment]::NewLine
 
-        if (-not [string]::IsNullOrWhiteSpace(`$stdout)) {
-            [Console]::Out.Write(`$stdout)
-        }
+        if (-not [string]::IsNullOrWhiteSpace(`$stdout)) { [Console]::Out.Write(`$stdout) }
+        if (-not [string]::IsNullOrWhiteSpace(`$filteredStderr)) { [Console]::Error.WriteLine(`$filteredStderr) }
 
-        if (-not [string]::IsNullOrWhiteSpace(`$filteredStderr)) {
-            [Console]::Error.WriteLine(`$filteredStderr)
-        }
-
-        `$exitCode = $null
-        try {
-            `$process.Refresh()
-            `$exitCode = `$process.ExitCode
-        } catch {
-        }
-
+        `$exitCode = `$null
+        try { `$process.Refresh(); `$exitCode = `$process.ExitCode } catch { }
         if (`$null -ne `$exitCode -and `$exitCode -ne 0) {
             throw ("agent-browser falhou com codigo {0}." -f `$exitCode)
         }
@@ -530,8 +531,8 @@ $navegadorCommand = Get-Command navegador -ErrorAction SilentlyContinue
 if (-not $navegadorCommand) {
     throw "A funcao navegador nao ficou disponivel apos carregar o `$PROFILE."
 }
-if ($navegadorCommand.Definition -notmatch "--executable-path" -or $navegadorCommand.Definition -notmatch "--disable-blink-features=AutomationControlled") {
-    throw "A definicao da funcao navegador nao contem as flags esperadas."
+if ($navegadorCommand.Definition -notmatch "--cdp" -or $navegadorCommand.Definition -notmatch "--remote-debugging-port" -or $navegadorCommand.Definition -notmatch "--disable-blink-features=AutomationControlled") {
+    throw "A definicao da funcao navegador nao contem as flags esperadas (--cdp / --remote-debugging-port)."
 }
 
 Write-Host "==> Registrando a skill globalmente no Windows"
@@ -609,12 +610,19 @@ set -euo pipefail
 AGENT_BROWSER_EXE='__AGENT_BROWSER_EXE__'
 PROFILE_WIN='__PROFILE_WIN__'
 CHROME_WIN='__CHROME_WIN__'
+DEBUG_PORT=9333
 
+# Garante o Chrome real do Windows aberto no perfil, lancado NORMALMENTE (sem
+# --disable-component-update), para registrar o componente Widevine e permitir
+# DRM/Netflix. Usamos o PowerShell do Windows para checar a porta de depuracao
+# e subir o Chrome quando necessario.
 if [ -n "$CHROME_WIN" ]; then
-    "$AGENT_BROWSER_EXE" --profile "$PROFILE_WIN" --headed --executable-path "$CHROME_WIN" --args "--disable-blink-features=AutomationControlled" "$@"
-else
-    "$AGENT_BROWSER_EXE" --profile "$PROFILE_WIN" --headed --args "--disable-blink-features=AutomationControlled" "$@"
+    powershell.exe -NoLogo -NoProfile -Command "if (-not (Get-NetTCPConnection -LocalPort $DEBUG_PORT -State Listen -ErrorAction SilentlyContinue)) { Start-Process -FilePath '$CHROME_WIN' -ArgumentList '--user-data-dir=\"$PROFILE_WIN\" --no-first-run --no-default-browser-check --remote-debugging-port=$DEBUG_PORT --disable-blink-features=AutomationControlled about:blank'; Start-Sleep -Seconds 2 }" >/dev/null 2>&1 || true
 fi
+
+# O agent-browser apenas CONECTA via --cdp; ele nunca lanca o Chrome (senao
+# injetaria --disable-component-update e o Widevine nao seria registrado).
+"$AGENT_BROWSER_EXE" --cdp "$DEBUG_PORT" "$@"
 '@
         $wslWrapper = $wslWrapper.Replace("__AGENT_BROWSER_EXE__", $agentBrowserExeLinux)
         $wslWrapper = $wslWrapper.Replace("__PROFILE_WIN__", $profileWin)

@@ -80,6 +80,12 @@ if ($chromeReal) {
 
 Nao use `agent-browser install` para baixar Chrome for Testing. O comportamento correto e falhar e pedir a instalacao do Google Chrome real.
 
+### 2.1 Sobre DRM (Netflix e outros streamings)
+
+Serviços com DRM dependem do componente Widevine. Há uma armadilha importante no Windows: quando o `agent-browser` **lança** o Chrome, ele injeta `--disable-component-update`, e essa flag impede o Chrome de **registrar** o Widevine. O resultado é que o EME falha (a Netflix pede para ativar `chrome://settings/content/protectedContent` mesmo já estando ativado). Copiar os arquivos do Widevine para o perfil **não resolve**, porque sem o component updater o Chrome nem registra um CDM já presente no disco.
+
+Por isso a função `navegador` (passo 3) **não deixa o `agent-browser` lançar o Chrome**: ela abre o Chrome real **normalmente** (com `--remote-debugging-port=9333`) e faz o `agent-browser` apenas **conectar** via `--cdp`. Lançado normalmente, o Chrome registra o Widevine bundled e o DRM passa a funcionar. Não há passo de "provisionamento" aqui — a verificação de DRM acontece no passo 4, depois que a função existir.
+
 ## 3. Criar a função navegador no PowerShell
 
 Adicione a função `navegador` ao `$PROFILE` do PowerShell. Ela sempre reutiliza o perfil `%USERPROFILE%\Navegador`.
@@ -106,6 +112,8 @@ O bloco usa os marcadores `# >>> navegador >>>` e `# <<< navegador <<<`. Se o bl
 
 Importante: a função `navegador` não pode abrir outro navegador ou outra janela alternativa quando `open`, `goto` ou `navigate` falharem ou demorarem demais. O comportamento correto é reutilizar a sessão existente; se o comando não responder em tempo razoável, interromper o processo e falhar explicitamente.
 
+A função abre o Chrome real **normalmente** (sem `--disable-component-update`) com `--remote-debugging-port=9333` e faz o `agent-browser` apenas **conectar** via `--cdp`. Isso é o que permite DRM/Netflix (veja o passo 2.1). O `agent-browser` nunca lança o Chrome aqui; se lançasse, injetaria `--disable-component-update` e o Widevine não seria registrado.
+
 ```powershell
 $beginMarker = '# >>> navegador >>>'
 $endMarker   = '# <<< navegador <<<'
@@ -117,18 +125,96 @@ function navegador {
         [string[]] `$Argumentos
     )
 
+    function ConvertTo-NavegadorCliArgument {
+        param([string]`$Value)
+        if (`$null -eq `$Value) { return '""' }
+        if (`$Value -match '[\s"]') { return '"' + (`$Value -replace '"', '\"') + '"' }
+        return `$Value
+    }
+
+    function Test-NavegadorPort {
+        param([int]`$Port)
+        return [bool](Get-NetTCPConnection -LocalPort `$Port -State Listen -ErrorAction SilentlyContinue)
+    }
+
+    function Get-NavegadorChromeProcs {
+        param([string]`$ProfileDir)
+        return @(Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { `$_.CommandLine -and `$_.CommandLine -match [regex]::Escape(`$ProfileDir) })
+    }
+
     `$chromePaths = @(
         "`$env:PROGRAMFILES\Google\Chrome\Application\chrome.exe",
         "`${env:PROGRAMFILES(x86)}\Google\Chrome\Application\chrome.exe",
         "`$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
     )
     `$chromeExe = `$chromePaths | Where-Object { Test-Path `$_ } | Select-Object -First 1
-
     if (-not `$chromeExe) {
         throw "Chrome not found. Install Google Chrome or check its installation path."
     }
 
-    agent-browser --profile "`$env:USERPROFILE\Navegador" --headed --executable-path `$chromeExe @Argumentos 2>`$null
+    `$agentBrowserExe = Join-Path "`$env:APPDATA" "npm\node_modules\agent-browser\bin\agent-browser-win32-x64.exe"
+    if (-not (Test-Path `$agentBrowserExe)) {
+        throw "agent-browser-win32-x64.exe not found. Reinstale o Navegador para restaurar a CLI."
+    }
+
+    `$profileDir = "`$env:USERPROFILE\Navegador"
+    `$debugPort = 9333
+
+    if (`$Argumentos.Count -ge 1 -and `$Argumentos[0] -eq 'close') {
+        try { & `$agentBrowserExe --cdp `$debugPort close 2>`$null | Out-Null } catch { }
+        foreach (`$proc in (Get-NavegadorChromeProcs -ProfileDir `$profileDir)) {
+            Stop-Process -Id `$proc.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        return
+    }
+
+    if (-not (Test-NavegadorPort -Port `$debugPort)) {
+        foreach (`$proc in (Get-NavegadorChromeProcs -ProfileDir `$profileDir)) {
+            Stop-Process -Id `$proc.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 400
+        `$chromeArgumentLine = '--user-data-dir="' + `$profileDir + '" --no-first-run --no-default-browser-check --remote-debugging-port=' + `$debugPort + ' --disable-blink-features=AutomationControlled about:blank'
+        Start-Process -FilePath `$chromeExe -ArgumentList `$chromeArgumentLine | Out-Null
+        `$deadline = (Get-Date).AddSeconds(20)
+        while (-not (Test-NavegadorPort -Port `$debugPort) -and (Get-Date) -lt `$deadline) {
+            Start-Sleep -Milliseconds 300
+        }
+        if (-not (Test-NavegadorPort -Port `$debugPort)) {
+            throw "Chrome nao abriu a porta de depuracao `$debugPort. Nenhum navegador alternativo foi aberto."
+        }
+    }
+
+    `$stdoutPath = Join-Path "`$env:TEMP" ("agent-browser-" + [guid]::NewGuid().ToString() + ".out")
+    `$stderrPath = Join-Path "`$env:TEMP" ("agent-browser-" + [guid]::NewGuid().ToString() + ".err")
+    try {
+        `$agentBrowserArgs = @('--cdp', "`$debugPort") + `$Argumentos
+        `$agentBrowserArgumentLine = ((`$agentBrowserArgs | ForEach-Object { ConvertTo-NavegadorCliArgument -Value `$_ }) -join ' ')
+        `$process = Start-Process -FilePath `$agentBrowserExe -ArgumentList `$agentBrowserArgumentLine -RedirectStandardOutput `$stdoutPath -RedirectStandardError `$stderrPath -PassThru -WindowStyle Hidden
+
+        `$timeoutSeconds = 30
+        if (-not `$process.WaitForExit(`$timeoutSeconds * 1000)) {
+            try { Stop-Process -Id `$process.Id -Force -ErrorAction SilentlyContinue } catch { }
+            throw ("agent-browser nao respondeu em {0} segundos. O comando foi interrompido sem abrir navegador alternativo." -f `$timeoutSeconds)
+        }
+
+        `$stdout = if (Test-Path `$stdoutPath) { Get-Content -Path `$stdoutPath -Raw } else { "" }
+        `$stderr = if (Test-Path `$stderrPath) { Get-Content -Path `$stderrPath -Raw } else { "" }
+        `$filteredStderr = ((`$stderr -split "\r?\n") | Where-Object {
+            `$_ -and `$_ -notmatch 'ignored: daemon already running'
+        }) -join [Environment]::NewLine
+
+        if (-not [string]::IsNullOrWhiteSpace(`$stdout)) { [Console]::Out.Write(`$stdout) }
+        if (-not [string]::IsNullOrWhiteSpace(`$filteredStderr)) { [Console]::Error.WriteLine(`$filteredStderr) }
+
+        `$exitCode = `$null
+        try { `$process.Refresh(); `$exitCode = `$process.ExitCode } catch { }
+        if (`$null -ne `$exitCode -and `$exitCode -ne 0) {
+            throw ("agent-browser falhou com codigo {0}." -f `$exitCode)
+        }
+    } finally {
+        Remove-Item -LiteralPath `$stdoutPath, `$stderrPath -Force -ErrorAction SilentlyContinue
+    }
 }
 $endMarker
 "@
@@ -148,14 +234,17 @@ if ($profileContent -match "(?ms)$([regex]::Escape($beginMarker)).*?$([regex]::E
 }
 ```
 
-Se existir uma instalação antiga que chame apenas `agent-browser --profile "$env:USERPROFILE\Navegador" --headed @Argumentos`, trate como desatualizada: substitua o bloco, feche o daemon e recarregue o `$PROFILE`.
+Se existir uma instalação antiga em que a função chame `agent-browser --profile ... --headed --executable-path ...` (ou seja, deixe o `agent-browser` lançar o Chrome), trate como desatualizada: substitua o bloco, encerre o Chrome/daemon e recarregue o `$PROFILE`.
 
 ### 3.3 Fechar o daemon e carregar a função
 
-O `agent-browser` usa daemon. Depois de iniciado, ele ignora novas flags como `--executable-path` e `--args` até ser fechado. Em upgrades, feche o daemon para reiniciar com as novas opções:
+O `agent-browser` usa daemon. Em upgrades de uma instalação antiga (que deixava o `agent-browser` lançar o Chrome), feche o daemon e qualquer Chrome do perfil para que a nova função possa reabrir o Chrome com a porta de depuração:
 
 ```powershell
 agent-browser close 2>$null
+Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" |
+    Where-Object { $_.CommandLine -and $_.CommandLine -match [regex]::Escape("$env:USERPROFILE\Navegador") } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 ```
 
 Depois carregue o `$PROFILE` atualizado na sessão atual:
@@ -173,7 +262,7 @@ Para validar a versão carregada:
 (Get-Command navegador).Definition
 ```
 
-A definição deve conter `--executable-path` e `--disable-blink-features=AutomationControlled`.
+A definição deve conter `--cdp`, `--remote-debugging-port` e `--disable-blink-features=AutomationControlled` (a função abre o Chrome e o `agent-browser` conecta via CDP).
 
 Depois disso, este comando:
 
@@ -181,13 +270,19 @@ Depois disso, este comando:
 navegador open myapp.com
 ```
 
-equivale a algo como:
+faz, nos bastidores, algo equivalente a: abrir o Chrome real **normalmente** uma vez
 
 ```powershell
-agent-browser --profile "%USERPROFILE%\Navegador" --headed --executable-path "C:\Program Files\Google\Chrome\Application\chrome.exe" --args "--disable-blink-features=AutomationControlled" open myapp.com
+chrome.exe --user-data-dir="%USERPROFILE%\Navegador" --no-first-run --no-default-browser-check --remote-debugging-port=9333 --disable-blink-features=AutomationControlled about:blank
 ```
 
-A flag `--disable-blink-features=AutomationControlled` oculta o marcador `navigator.webdriver`, usado por alguns sites para detectar automação.
+e então conectar o `agent-browser` a esse Chrome:
+
+```powershell
+agent-browser --cdp 9333 open myapp.com
+```
+
+A flag `--disable-blink-features=AutomationControlled` oculta o marcador `navigator.webdriver`, usado por alguns sites para detectar automação. Lançar o Chrome dessa forma (sem `--disable-component-update`) é o que mantém o Widevine registrado e o DRM funcionando.
 
 ## 4. Testar o navegador
 
@@ -207,6 +302,33 @@ navegador open https://accounts.google.com
 O Google não deve exibir aviso de "navegador inseguro" ou "acesso bloqueado". Se exibir, o daemon ainda pode estar usando a configuração antiga ou o `$PROFILE` atualizado pode não ter sido recarregado. Rode `agent-browser close`, recarregue com `. $PROFILE`, confirme `(Get-Command navegador).Definition` e teste novamente.
 
 Evite `wait 5000` como prova de carregamento. Prefira esperar por um seletor ou estado observável, como `body`, `h1` ou outro seletor específico da página.
+
+### 4.1 Verificar DRM (Widevine / Netflix)
+
+Confirme que o DRM está funcionando antes de finalizar. Com a função carregada, abra uma página qualquer e pergunte ao próprio Chrome se ele consegue negociar o Widevine via EME. Guarde o resultado em `$drmStatus`:
+
+```powershell
+navegador open https://example.com 2>$null | Out-Null
+$drmJs = @'
+(async () => {
+  const cfg = [{ initDataTypes: ['cenc'], audioCapabilities: [{ contentType: 'audio/mp4; codecs="mp4a.40.2"' }], videoCapabilities: [{ contentType: 'video/mp4; codecs="avc1.42E01E"' }] }];
+  try { const a = await navigator.requestMediaKeySystemAccess('com.widevine.alpha', cfg); await a.createMediaKeys(); return 'OK'; }
+  catch (e) { return 'FAIL: ' + e.name; }
+})()
+'@
+$drmOut = navegador eval $drmJs 2>$null
+if ($drmOut -match 'OK') {
+    $drmStatus = "OK: o Chrome do Navegador negocia o Widevine; Netflix e outros streamings com DRM devem funcionar."
+} else {
+    $drmStatus = "FALHA: o Widevine nao foi negociado ($drmOut). Verifique se a funcao abre o Chrome com --remote-debugging-port (sem --disable-component-update) e se o Chrome tem o WidevineCdm bundled."
+}
+Write-Host $drmStatus
+```
+
+Guarde o valor de `$drmStatus`. Você vai precisar dele no relatório final **e** na mensagem em texto para o usuário.
+
+- Se começar com `OK:`, o DRM está funcionando — não há nada a fazer.
+- Se começar com `FALHA:`, **avise o usuário explicitamente, por texto**, que Netflix e outros streamings com DRM podem não funcionar. Investigue: a causa quase sempre é a função ainda estar deixando o `agent-browser` lançar o Chrome (jeito antigo, com `--disable-component-update`). Confirme `(Get-Command navegador).Definition`, rode `navegador close`, recarregue o `$PROFILE` e teste de novo. Não trate como falha total da instalação — o resto da skill funciona.
 
 ## 5. Registrar a skill globalmente
 
@@ -315,7 +437,7 @@ Notas importantes:
 
 - O nome de usuário do WSL costuma ser diferente do nome do Windows. Isso não impede a instalação, porque o wrapper é gravado no `$HOME` da própria distro.
 - Evite chamar `powershell.exe` para executar `navegador` dentro do WSL. Na prática isso pode concluir a automação e ainda deixar o processo Unix pendurado.
-- O wrapper do WSL deve chamar diretamente `agent-browser-win32-x64.exe`, fixando `--profile`, `--headed`, `--args "--disable-blink-features=AutomationControlled"` e, quando existir, `--executable-path` para o Chrome real do Windows.
+- O wrapper do WSL deve garantir o Chrome real do Windows aberto **normalmente** (sem `--disable-component-update`) com `--remote-debugging-port=9333` e então chamar `agent-browser-win32-x64.exe --cdp 9333`. Ele usa `powershell.exe` só para checar a porta e subir o Chrome quando preciso. Não deixe o `agent-browser` lançar o Chrome, senão o Widevine (DRM/Netflix) não é registrado.
 - Prefira um executável em `~/.local/bin` em vez de uma função no `.bashrc`. Assim o comando funciona em shells não interativos e evita a necessidade de `bash -ic`, que pode deixar processos pendurados em agentes que rodam sem TTY.
 - Se o PowerShell estiver rodando a partir de `\\wsl.localhost\...`, mude antes para um diretório do Windows com `Push-Location $env:USERPROFILE`. Sem isso, o `wsl.exe` pode falhar ao tentar traduzir o diretório atual.
 - Quoting entre PowerShell e bash é frágil para here-docs, regex e caminhos Windows. Por isso este passo grava arquivos temporários em `$env:TEMP`, converte o caminho para `/mnt/c/...` e chama `wsl`.
@@ -406,12 +528,19 @@ set -euo pipefail
 AGENT_BROWSER_EXE='__AGENT_BROWSER_EXE__'
 PROFILE_WIN='__PROFILE_WIN__'
 CHROME_WIN='__CHROME_WIN__'
+DEBUG_PORT=9333
 
+# Garante o Chrome real do Windows aberto no perfil, lancado NORMALMENTE (sem
+# --disable-component-update), para registrar o componente Widevine e permitir
+# DRM/Netflix. Usamos o PowerShell do Windows para checar a porta de depuracao
+# e subir o Chrome quando necessario.
 if [ -n "$CHROME_WIN" ]; then
-    "$AGENT_BROWSER_EXE" --profile "$PROFILE_WIN" --headed --executable-path "$CHROME_WIN" --args "--disable-blink-features=AutomationControlled" "$@"
-else
-    "$AGENT_BROWSER_EXE" --profile "$PROFILE_WIN" --headed --args "--disable-blink-features=AutomationControlled" "$@"
+    powershell.exe -NoLogo -NoProfile -Command "if (-not (Get-NetTCPConnection -LocalPort $DEBUG_PORT -State Listen -ErrorAction SilentlyContinue)) { Start-Process -FilePath '$CHROME_WIN' -ArgumentList '--user-data-dir=\"$PROFILE_WIN\" --no-first-run --no-default-browser-check --remote-debugging-port=$DEBUG_PORT --disable-blink-features=AutomationControlled about:blank'; Start-Sleep -Seconds 2 }" >/dev/null 2>&1 || true
 fi
+
+# O agent-browser apenas CONECTA via --cdp; ele nunca lanca o Chrome (senao
+# injetaria --disable-component-update e o Widevine nao seria registrado).
+"$AGENT_BROWSER_EXE" --cdp "$DEBUG_PORT" "$@"
 '@
     $wrapperWsl = $wrapperWsl.Replace('__AGENT_BROWSER_EXE__', $agentBrowserExeLinux)
     $wrapperWsl = $wrapperWsl.Replace('__PROFILE_WIN__', $profileWin)
@@ -554,6 +683,9 @@ Softwares instalados:
 - agent-browser: <versão obtida em `agent-browser --version` ou `npm list -g agent-browser`>
 - Chrome usado: <caminho do Chrome real detectado, ex: C:\Program Files\Google\Chrome\Application\chrome.exe>
 
+DRM (Widevine):
+- <valor de $drmStatus do passo 4.1, ex: OK: o Chrome do Navegador negocia o Widevine... | FALHA: ...>
+
 Arquivos criados:
 - <caminho do $PROFILE, se foi criado neste passo>
 - <%USERPROFILE%\.codex\skills\navegador\SKILL.md, se aplicável>
@@ -576,6 +708,8 @@ Status geral: <sucesso | sucesso parcial: <motivo> | falha: <motivo>>
 ```
 
 Termine lembrando o usuário de reiniciar o cliente de IA, caso ainda não tenha feito.
+
+Além do relatório no terminal, escreva uma mensagem em texto para o usuário (na conversa, não só no terminal) resumindo o status geral e, obrigatoriamente, o status do DRM/Widevine do passo 4.1: diga se ficou `OK` ou `FALHA`. Se ficou `FALHA`, explique em texto que Netflix e outros streamings com DRM podem não funcionar e o que verificar (confirmar que a função abre o Chrome com `--remote-debugging-port` e conecta via `--cdp`, em vez de deixar o `agent-browser` lançar o Chrome). O usuário não deve precisar ler a saída do terminal para descobrir isso.
 
 ## Apêndice — rollback
 
